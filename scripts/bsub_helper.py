@@ -1,17 +1,16 @@
 """
 Gregory Way 2017
-Variational Autoencoder - Pan Cancer
+Tybalt - Variational Autoencoder on Pan Cancer Gene Expression
 scripts/bsub_helper.py
 
 Usage: Import only
-from bsub_helper import bsub_help
 
-from bsub_helper import bsub_help
-b = bsub_help(command)
+    from bsub_helper import bsub_help
+    b = bsub_help(command)
 
-b.make_command_list()
-b.make_command_string()
-b.submit_command()  # directly submit bsub job to pmacs
+    b.make_command_list()    # To make a python list of commands
+    b.make_command_string()  # To make a python string of commands
+    b.submit_command()       # Directly submit bsub job to pmacs
 """
 
 
