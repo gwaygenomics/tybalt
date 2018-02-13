@@ -3,9 +3,20 @@ Gregory Way 2017
 Variational Autoencoder - Pan Cancer
 scripts/vae_pancancer.py
 
-Usage: Run in command line with required command arguments:
+Usage:
 
-        python scripts/vae_pancancer.py --parameter_file <parameter-filepath>
+    Run in command line with required command arguments:
+
+        python scripts/vae_pancancer.py --learning_rate
+                                        --batch_size
+                                        --epochs
+                                        --kappa
+                                        --depth
+                                        --output_filename
+
+    Typically, arguments to this script are compiled automatically by:
+
+        python scripts/vae_paramsweep.py --parameter_file <parameter-filepath>
                                          --config_file <configuration-filepath>
 
 Output:
@@ -20,7 +31,7 @@ import pandas as pd
 import tensorflow as tf
 from keras.layers import Input, Dense, Lambda, Layer, Activation
 from keras.layers.normalization import BatchNormalization
-from keras.models import Model
+from keras.models import Model, Sequential
 from keras import backend as K
 from keras import metrics, optimizers
 from keras.callbacks import Callback
@@ -34,6 +45,11 @@ parser.add_argument('-e', '--epochs',
                     help='How many times to cycle through the full dataset')
 parser.add_argument('-k', '--kappa',
                     help='How fast to linearly ramp up KL loss')
+parser.add_argument('-d', '--depth',
+                    help='Number of layers between input and latent layer')
+parser.add_argument('-c', '--first_layer',
+                    help='Dimensionality of the first hidden layer',
+                    default=100)
 parser.add_argument('-f', '--output_filename',
                     help='The name of the file to store results')
 args = parser.parse_args()
@@ -43,12 +59,25 @@ learning_rate = float(args.learning_rate)
 batch_size = int(args.batch_size)
 epochs = int(args.epochs)
 kappa = float(args.kappa)
+depth = int(args.depth)
+first_layer = int(args.first_layer)
 output_filename = args.output_filename
 
-original_dim = 5000
+# Load Data
+rnaseq_file = os.path.join('data', 'pancan_scaled_zeroone_rnaseq.tsv.gz')
+rnaseq_df = pd.read_table(rnaseq_file, index_col=0)
+
+# Set architecture dimensions
+original_dim = rnaseq_df.shape[1]
 latent_dim = 100
 epsilon_std = 1.0
 beta = K.variable(0)
+if depth == 2:
+    latent_dim2 = int(first_layer)
+
+# Random seed
+seed = int(np.random.randint(low=0, high=10000, size=1))
+np.random.seed(seed)
 
 
 # Function for reparameterization trick to make model differentiable
@@ -104,10 +133,7 @@ class WarmUpCallback(Callback):
         if K.get_value(self.beta) <= 1:
             K.set_value(self.beta, K.get_value(self.beta) + self.kappa)
 
-np.random.seed(123)
-
-rnaseq_file = os.path.join('data', 'pancan_scaled_zeroone_rnaseq.tsv')
-rnaseq_df = pd.read_table(rnaseq_file, index_col=0)
+# Process data
 
 # Split 10% test set randomly
 test_set_percent = 0.1
@@ -117,20 +143,34 @@ rnaseq_train_df = rnaseq_df.drop(rnaseq_test_df.index)
 # Input place holder for RNAseq data with specific input size
 rnaseq_input = Input(shape=(original_dim, ))
 
-
 # ~~~~~~~~~~~~~~~~~~~~~~
 # ENCODER
 # ~~~~~~~~~~~~~~~~~~~~~~
-# Input layer is compressed into a mean and log variance vector of size
-# `latent_dim`. Each layer is initialized with glorot uniform weights and each
-# step (dense connections, batch norm,and relu activation) are funneled
-# separately
+# Depending on the depth of the model, the input is eventually compressed into
+# a mean and log variance vector of prespecified size. Each layer is
+# initialized with glorot uniform weights and each step (dense connections,
+# batch norm,and relu activation) are funneled separately
+#
 # Each vector of length `latent_dim` are connected to the rnaseq input tensor
-z_mean_dense_linear = Dense(latent_dim, kernel_initializer='glorot_uniform')(rnaseq_input)
+# In the case of a depth 2 architecture, input_dim -> latent_dim -> latent_dim2
+
+if depth == 1:
+    z_shape = latent_dim
+    z_mean_dense_linear = Dense(latent_dim, kernel_initializer='glorot_uniform')(rnaseq_input)
+    z_log_var_dense_linear = Dense(latent_dim, kernel_initializer='glorot_uniform')(rnaseq_input)
+
+elif depth == 2:
+    z_shape = latent_dim2
+    hidden_dense_linear = Dense(latent_dim, kernel_initializer='glorot_uniform')(rnaseq_input)
+    hidden_dense_batchnorm = BatchNormalization()(hidden_dense_linear)
+    hidden_encoded = Activation('relu')(hidden_dense_batchnorm)
+
+    z_mean_dense_linear = Dense(latent_dim2, kernel_initializer='glorot_uniform')(hidden_encoded)
+    z_log_var_dense_linear = Dense(latent_dim2, kernel_initializer='glorot_uniform')(hidden_encoded)
+
 z_mean_dense_batchnorm = BatchNormalization()(z_mean_dense_linear)
 z_mean_encoded = Activation('relu')(z_mean_dense_batchnorm)
 
-z_log_var_dense_linear = Dense(latent_dim, kernel_initializer='glorot_uniform')(rnaseq_input)
 z_log_var_dense_batchnorm = BatchNormalization()(z_log_var_dense_linear)
 z_log_var_encoded = Activation('relu')(z_log_var_dense_batchnorm)
 
@@ -138,16 +178,29 @@ z_log_var_encoded = Activation('relu')(z_log_var_dense_batchnorm)
 # Takes two keras layers as input to the custom sampling function layer with a
 # latent_dim` output
 z = Lambda(sampling,
-           output_shape=(latent_dim, ))([z_mean_encoded, z_log_var_encoded])
+           output_shape=(z_shape, ))([z_mean_encoded, z_log_var_encoded])
 
 # ~~~~~~~~~~~~~~~~~~~~~~
 # DECODER
 # ~~~~~~~~~~~~~~~~~~~~~~
-# The decoding layer is much simpler with a single layer glorot uniform
-# initialized and sigmoid activation
-decoder_to_reconstruct = Dense(original_dim,
-                               kernel_initializer='glorot_uniform',
-                               activation='sigmoid')
+# The layers are different depending on the prespecified depth.
+#
+# Single layer: glorot uniform initialized and sigmoid activation.
+# Double layer: relu activated hidden layer followed by sigmoid reconstruction
+if depth == 1:
+    decoder_to_reconstruct = Dense(original_dim,
+                                   kernel_initializer='glorot_uniform',
+                                   activation='sigmoid')
+elif depth == 2:
+    decoder_to_reconstruct = Sequential()
+    decoder_to_reconstruct.add(Dense(latent_dim,
+                                     kernel_initializer='glorot_uniform',
+                                     activation='relu',
+                                     input_dim=latent_dim2))
+    decoder_to_reconstruct.add(Dense(original_dim,
+                                     kernel_initializer='glorot_uniform',
+                                     activation='sigmoid'))
+
 rnaseq_reconstruct = decoder_to_reconstruct(z)
 
 # ~~~~~~~~~~~~~~~~~~~~~~
@@ -159,7 +212,6 @@ vae = Model(rnaseq_input, vae_layer)
 vae.compile(optimizer=adam, loss=None, loss_weights=[beta])
 
 # fit Model
-
 hist = vae.fit(np.array(rnaseq_train_df),
                shuffle=True,
                epochs=epochs,
@@ -174,4 +226,7 @@ history_df = history_df.assign(learning_rate=learning_rate)
 history_df = history_df.assign(batch_size=batch_size)
 history_df = history_df.assign(epochs=epochs)
 history_df = history_df.assign(kappa=kappa)
+history_df = history_df.assign(seed=seed)
+history_df = history_df.assign(depth=depth)
+history_df = history_df.assign(first_layer=first_layer)
 history_df.to_csv(output_filename, sep='\t')
